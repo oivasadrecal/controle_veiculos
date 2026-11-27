@@ -36,9 +36,9 @@
 
         <div class="topbar-actions">
           <button type="button" id="btn-sheets-status" class="sync-pill"
-            title="Sincronizar com Google Sheets">
+            title="Status do Firebase, configurações e importação de planilha">
             <span class="sync-dot" aria-hidden="true"></span>
-            <span id="sync-status-label">Google Sheets</span>
+            <span id="sync-status-label">Conectando...</span>
           </button>
 
           <button type="button" id="btn-refresh" class="btn btn-ghost btn-icon" title="Sincronizar dados agora"
@@ -490,13 +490,13 @@
     </div>
   </div>
 
-  <!-- Modal: Sincronizar com Google Sheets -->
+  <!-- Modal: Banco de Dados (Firebase) e Importação de Planilha -->
   <div id="sheets-modal" class="modal-backdrop" hidden aria-hidden="true">
     <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="sheets-modal-title">
       <div class="modal-header">
         <div>
-          <h2 id="sheets-modal-title">Sincronizar com Google Sheets</h2>
-          <p class="modal-subtitle">Conecte sua planilha online sem complicação.</p>
+          <h2 id="sheets-modal-title">Banco de Dados · Firebase</h2>
+          <p class="modal-subtitle">Salvamento automático na nuvem em tempo real.</p>
         </div>
         <button type="button" class="btn btn-ghost btn-icon" data-close-modal="sheets-modal" aria-label="Fechar">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
@@ -509,25 +509,8 @@
 
       <form id="sheets-form" class="modal-body">
         <div class="connection-box" id="connection-box">
-          <span class="connection-state-badge" id="modal-conn-badge">Sem planilha conectada</span>
-          <p id="modal-conn-desc">Cole o link do seu Google Sheets abaixo para importar e sincronizar as viaturas.</p>
-        </div>
-
-        <div class="form-field">
-          <label for="sheets-url-input">Link da planilha do Google Sheets</label>
-          <input type="url" id="sheets-url-input" placeholder="https://docs.google.com/spreadsheets/d/..."
-            class="mono-input">
-          <small class="field-help">
-            <strong>Dica:</strong> No Google Sheets, vá em <strong>Arquivo &gt; Compartilhar &gt; Publicar na web (formato CSV)</strong> ou deixe o link como <strong>"Qualquer pessoa com o link pode ver"</strong> e cole o link acima.
-          </small>
-        </div>
-
-        <div class="template-box">
-          <div>
-            <strong>Colunas reconhecidas na planilha</strong>
-            <p>Prefixo, Placa, Modelo, Unidade, Dielétrico, Tacógrafo, Acústico, Laudos e Observações (datas em <code>DD/MM/AAAA</code>).</p>
-          </div>
-          <button type="button" id="btn-download-template" class="btn btn-sm btn-secondary">Baixar modelo (.csv)</button>
+          <span class="connection-state-badge" id="modal-conn-badge">Conectando...</span>
+          <p id="modal-conn-desc">Todos os cadastros, renovações e observações ficam salvos automaticamente no Firebase Firestore.</p>
         </div>
 
         <div class="form-field">
@@ -535,12 +518,26 @@
           <input type="number" id="alert-days-input" min="1" max="180" value="15">
         </div>
 
-        <div class="modal-footer modal-footer-split">
-          <button type="button" id="btn-disconnect-sheets" class="btn btn-ghost-danger" hidden>Desconectar planilha</button>
-          <div class="modal-footer-right">
-            <button type="button" class="btn btn-secondary" data-close-modal="sheets-modal">Fechar</button>
-            <button type="submit" id="btn-save-sheets" class="btn btn-primary">Sincronizar agora</button>
+        <div class="form-field">
+          <label for="sheets-url-input">Importar viaturas de uma planilha do Google Sheets (opcional)</label>
+          <input type="url" id="sheets-url-input" placeholder="https://docs.google.com/spreadsheets/d/..."
+            class="mono-input">
+          <small class="field-help">
+            Se já tiver viaturas numa planilha do Google Sheets (com acesso "Qualquer pessoa com o link pode ver" ou CSV publicado), cole o link acima e clique em <strong>Importar para o Firebase</strong> para copiar tudo de uma vez.
+          </small>
+        </div>
+
+        <div class="template-box">
+          <div>
+            <strong>Importar planilha para o Firebase</strong>
+            <p>Puxa as viaturas da planilha acima e salva todas no seu Firebase.</p>
           </div>
+          <button type="button" id="btn-import-sheet-to-firebase" class="btn btn-sm btn-secondary">Importar para o Firebase</button>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close-modal="sheets-modal">Fechar</button>
+          <button type="submit" id="btn-save-sheets" class="btn btn-primary">Salvar configurações</button>
         </div>
       </form>
     </div>
@@ -599,6 +596,9 @@
   <!-- Região de Notificações (Toast) -->
   <div id="toast-container" class="toast-container" aria-live="polite" aria-atomic="true"></div>
 
+  <!-- Firebase SDK (compat: funciona tanto online quanto abrindo o index.html direto no PC) -->
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
   <script src="config.js"></script>
   <script src="app.js"></script>
 </body>

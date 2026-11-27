@@ -1,24 +1,33 @@
 # Controle de Vencimentos da Frota / OTNB-CX
 
-Aplicação web em **HTML, CSS e JavaScript puro** integrada ao **Google Sheets** para acompanhar e controlar os vencimentos dos sistemas **Dielétrico** (6 meses), **Tacógrafo** (2 anos) e **Acústico** (1 ano), com semáforo visual (**alerta amarelo 15 dias antes**).
+Aplicação web em **HTML, CSS e JavaScript puro** integrada em tempo real ao **Firebase Firestore** para cadastrar viaturas e acompanhar o vencimento dos sistemas **Dielétrico** (6 meses), **Tacógrafo** (2 anos) e **Acústico** (1 ano), com semáforo visual (**alerta amarelo 15 dias antes**).
 
-## Como conectar ao Google Sheets (jeito simples, sem Apps Script)
+## Banco de Dados (Firebase Firestore)
 
-1. Crie uma planilha no [Google Sheets](https://sheets.google.com) com as colunas na linha 1 (ou clique em **Google Sheets → Baixar modelo (.csv)** no site e importe):
-   - `Prefixo`, `Placa`, `Modelo`, `Unidade`, `Venc. Dielétrico`, `Laudo Dielétrico`, `Venc. Tacógrafo`, `Cert. Tacógrafo`, `Venc. Acústico`, `Laudo Acústico`, `Observações`
-2. No Google Sheets, escolha uma das duas opções:
-   - **Arquivo → Compartilhar → Publicar na web → formato Valores separados por vírgula (.csv)**, **ou**
-   - **Compartilhar → "Qualquer pessoa com o link pode ver"** e copie o link da planilha.
-3. Cole o link no botão **Google Sheets** do site e clique em **Sincronizar agora** — ou cole fixo no campo `GOOGLE_SHEETS_URL` dentro de `config.js` antes de publicar online.
+O projeto já está conectado ao projeto Firebase `controle-veiculos-64b30` (coleção `viaturas`) em `config.js`:
+- Cadastros, edições, **Observações**, renovações rápidas e exclusões são salvos automaticamente na nuvem e sincronizam em **tempo real** entre todos os dispositivos abertos.
+- Códigos de prefixo como `0077-7` são gravados como texto puro (nunca convertidos em data).
+
+### Importante: Regras do Firestore (para não expirar em 30 dias)
+No **Console do Firebase → Firestore Database → Regras**, se você criou o banco em *Modo de teste*, a regra padrão expira em 30 dias. Para manter o painel funcionando continuamente sem login, use:
+
+```
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /viaturas/{docId} {
+      allow read, write: if true;
+    }
+  }
+}
+```
+
+## Importar Planilha Antiga & Exportar Relatórios
+
+- **Importar do Google Sheets:** clique no botão **Firebase online** no topo, cole o link de uma planilha pública do Google Sheets e clique em **Importar para o Firebase**.
+- **Exportar:** clique em **Exportar** no topo para baixar **Planilha Excel (.csv)**, **Relatório PDF / Imprimir** ou **Backup completo (.json)**.
 
 ## Publicar Online Gratuitamente
 
-- **Netlify Drop:** arraste a pasta `controle_veiculos` em [app.netlify.com/drop](https://app.netlify.com/drop) para receber o link `https://...netlify.app`.
-- **GitHub Pages:** suba os arquivos em um repositório e ative **Settings → Pages**.
-
-## Exportar Relatórios
-
-Clique em **Exportar** no topo da página para:
-- **Planilha Excel (.csv)** — compatível com Microsoft Excel em português.
-- **Relatório PDF / Imprimir** — layout limpo em paisagem pronto para salvar como PDF.
-- **Backup completo (.json)** — cópia de segurança dos cadastros.
+- **GitHub Pages:** suba os arquivos no repositório e ative **Settings → Pages → Branch `main`**.
+- **Netlify Drop:** arraste a pasta `controle_veiculos` em [app.netlify.com/drop](https://app.netlify.com/drop).

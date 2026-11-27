@@ -1,15 +1,20 @@
 /**
- * Configuração do Painel de Controle de Viaturas
- *
- * Para deixar o site conectado definitivamente ao seu Google Sheets:
- * 1. No Google Sheets, vá em Arquivo > Compartilhar > Publicar na web (formato CSV)
- *    OU compartilhe como "Qualquer pessoa com o link pode ver".
- * 2. Cole o link entre as aspas de GOOGLE_SHEETS_URL abaixo.
- * 3. Salve e publique os arquivos (Netlify, GitHub Pages ou Vercel).
+ * Configuração do Painel de Controle de Viaturas (OTNB-CX)
+ * Banco de dados em tempo real: Firebase Firestore
  */
 window.FLEET_CONFIG = {
-  // Cole o link do seu Google Sheets aqui:
-  GOOGLE_SHEETS_URL: '',
+  // Configuração do seu projeto Firebase
+  FIREBASE_CONFIG: {
+    apiKey: 'AIzaSyA_ZvcW-Ru71JWQi43Cg9XkOyh2tIF9KC4',
+    authDomain: 'controle-veiculos-64b30.firebaseapp.com',
+    projectId: 'controle-veiculos-64b30',
+    storageBucket: 'controle-veiculos-64b30.firebasestorage.app',
+    messagingSenderId: '100543743955',
+    appId: '1:100543743955:web:6e7f12c60c9104d2ec1126'
+  },
+
+  // Nome da coleção no Firestore onde as viaturas ficam salvas
+  FIRESTORE_COLLECTION: 'viaturas',
 
   // Quantidade de dias antes do vencimento para acender o alerta amarelo
   ALERT_DAYS: 15,

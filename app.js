@@ -3,7 +3,6 @@
 
   const STORAGE_KEYS = {
     LOCAL_VEHICLES: 'controle_veiculos_local_v1',
-    CUSTOM_URL: 'controle_veiculos_sheets_url_v1',
     ALERT_DAYS: 'controle_veiculos_alert_days_v1'
   };
 
@@ -19,31 +18,28 @@
     systemFilter: 'all',     // all | dieletrico | tacografo | acustico
     search: '',
     sortBy: 'urgency',
-    loading: false,
+    loading: true,
     saving: false,
+    firebaseReady: false,
+    firebaseConnected: false,
     connectionError: false,
+    connectionErrorDetail: '',
     pendingDeleteId: null,
     renewTarget: null        // { vehicleId, sysKey, activeMonths }
   };
 
+  let db = null;
+  let unsubscribeSnapshot = null;
+
   // ---------- Helpers de Configuração ----------
-  function getSheetUrl() {
+  function getFirebaseConfig() {
     const cfg = window.FLEET_CONFIG || {};
-    const fromConfig = cfg.GOOGLE_SHEETS_URL || cfg.APPS_SCRIPT_URL || '';
-    const fromStorage = localStorage.getItem(STORAGE_KEYS.CUSTOM_URL) || '';
-    return (fromStorage || fromConfig).trim();
+    return cfg.FIREBASE_CONFIG && cfg.FIREBASE_CONFIG.projectId ? cfg.FIREBASE_CONFIG : null;
   }
 
-  function hasSheetConfigured() {
-    return Boolean(getSheetUrl());
-  }
-
-  function isAppsScriptUrl(url) {
-    return /^https:\/\/script\.google\.com\/macros\/s\/.+\/exec/i.test(String(url || '').trim());
-  }
-
-  function isWritableCloudMode() {
-    return isAppsScriptUrl(getSheetUrl());
+  function getCollectionName() {
+    const cfg = window.FLEET_CONFIG || {};
+    return (cfg.FIRESTORE_COLLECTION || 'viaturas').trim();
   }
 
   function getAlertDays() {
@@ -211,37 +207,231 @@
     return { evals, overallStatus, minRank };
   }
 
-  // ---------- Armazenamento Local (sem dados de demonstração) ----------
+  // ---------- Fallback Local (caso o navegador abra sem internet) ----------
   function loadLocalVehicles() {
     try {
       const raw = localStorage.getItem(STORAGE_KEYS.LOCAL_VEHICLES);
       if (raw) {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) {
-          // Remove registros fictícios antigos caso existam no navegador
-          const cleaned = parsed.filter((v) => v && !String(v.id || '').startsWith('vtr-demo-'));
-          if (cleaned.length !== parsed.length) {
-            saveLocalVehicles(cleaned);
-          }
-          return cleaned;
+          return parsed.filter((v) => v && !String(v.id || '').startsWith('vtr-demo-'));
         }
       }
     } catch (_) {
-      // ignora erro de parse
+      // ignora
     }
     return [];
   }
 
   function saveLocalVehicles(list) {
-    localStorage.setItem(STORAGE_KEYS.LOCAL_VEHICLES, JSON.stringify(list));
+    try {
+      localStorage.setItem(STORAGE_KEYS.LOCAL_VEHICLES, JSON.stringify(list));
+    } catch (_) {
+      // ignora limite de storage
+    }
   }
 
-  // ---------- Google Sheets (CSV direto: Publicar na Web ou Link Compartilhado) ----------
+  // ---------- Firebase Firestore (Tempo Real) ----------
+  function formatFirebaseError(err) {
+    const code = err && err.code ? String(err.code) : '';
+    if (code === 'permission-denied') {
+      return 'Permissão negada no Firestore. No Console do Firebase > Firestore Database > Regras, verifique se leitura/escrita estão liberadas.';
+    }
+    if (code === 'unavailable') {
+      return 'Sem conexão com o Firebase no momento. Verifique sua internet.';
+    }
+    return (err && err.message) ? err.message : String(err || 'Erro desconhecido no Firebase');
+  }
+
+  function initFirebase() {
+    const fbCfg = getFirebaseConfig();
+    if (!fbCfg || typeof window.firebase === 'undefined') {
+      state.firebaseReady = false;
+      state.loading = false;
+      state.vehicles = normalizeVehicleList(loadLocalVehicles());
+      renderAll();
+      return;
+    }
+
+    try {
+      if (!window.firebase.apps.length) {
+        window.firebase.initializeApp(fbCfg);
+      }
+      db = window.firebase.firestore();
+      state.firebaseReady = true;
+      subscribeFirestore();
+    } catch (err) {
+      state.firebaseReady = false;
+      state.connectionError = true;
+      state.connectionErrorDetail = formatFirebaseError(err);
+      state.loading = false;
+      state.vehicles = normalizeVehicleList(loadLocalVehicles());
+      renderAll();
+      showToast(`Erro ao iniciar Firebase: ${state.connectionErrorDetail}`, 'error');
+    }
+  }
+
+  function subscribeFirestore() {
+    if (!db) return;
+    if (unsubscribeSnapshot) {
+      unsubscribeSnapshot();
+      unsubscribeSnapshot = null;
+    }
+
+    state.loading = true;
+    state.connectionError = false;
+    renderAll();
+
+    unsubscribeSnapshot = db.collection(getCollectionName()).onSnapshot(
+      (snapshot) => {
+        const list = [];
+        snapshot.forEach((doc) => {
+          const data = doc.data() || {};
+          list.push({
+            id: doc.id,
+            prefixo: sanitizePrefixo(data.prefixo || ''),
+            placa: String(data.placa || '').trim(),
+            modelo: String(data.modelo || '').trim(),
+            unidade: String(data.unidade || '').trim(),
+            dieletrico_vencimento: normalizeFlexibleDate(data.dieletrico_vencimento || ''),
+            dieletrico_laudo: String(data.dieletrico_laudo || '').trim(),
+            tacografo_vencimento: normalizeFlexibleDate(data.tacografo_vencimento || ''),
+            tacografo_laudo: String(data.tacografo_laudo || '').trim(),
+            acustico_vencimento: normalizeFlexibleDate(data.acustico_vencimento || ''),
+            acustico_laudo: String(data.acustico_laudo || '').trim(),
+            observacoes: String(data.observacoes || '').trim(),
+            atualizado_em: String(data.atualizado_em || '')
+          });
+        });
+
+        state.vehicles = list;
+        state.firebaseConnected = true;
+        state.connectionError = false;
+        state.connectionErrorDetail = '';
+        state.loading = false;
+        saveLocalVehicles(list);
+        renderAll();
+      },
+      (err) => {
+        state.firebaseConnected = false;
+        state.connectionError = true;
+        state.connectionErrorDetail = formatFirebaseError(err);
+        state.loading = false;
+        state.vehicles = normalizeVehicleList(loadLocalVehicles());
+        renderAll();
+        showToast(state.connectionErrorDetail, 'error');
+      }
+    );
+  }
+
+  async function manualRefresh() {
+    const refreshBtn = document.getElementById('btn-refresh');
+    refreshBtn.classList.add('is-spinning');
+
+    try {
+      if (db) {
+        const snapshot = await db.collection(getCollectionName()).get({ source: 'server' });
+        const list = [];
+        snapshot.forEach((doc) => {
+          const data = doc.data() || {};
+          list.push({
+            id: doc.id,
+            prefixo: sanitizePrefixo(data.prefixo || ''),
+            placa: String(data.placa || '').trim(),
+            modelo: String(data.modelo || '').trim(),
+            unidade: String(data.unidade || '').trim(),
+            dieletrico_vencimento: normalizeFlexibleDate(data.dieletrico_vencimento || ''),
+            dieletrico_laudo: String(data.dieletrico_laudo || '').trim(),
+            tacografo_vencimento: normalizeFlexibleDate(data.tacografo_vencimento || ''),
+            tacografo_laudo: String(data.tacografo_laudo || '').trim(),
+            acustico_vencimento: normalizeFlexibleDate(data.acustico_vencimento || ''),
+            acustico_laudo: String(data.acustico_laudo || '').trim(),
+            observacoes: String(data.observacoes || '').trim(),
+            atualizado_em: String(data.atualizado_em || '')
+          });
+        });
+        state.vehicles = list;
+        state.firebaseConnected = true;
+        state.connectionError = false;
+        state.connectionErrorDetail = '';
+        saveLocalVehicles(list);
+        renderAll();
+        showToast(`Sincronizado com Firebase (${list.length} viatura(s)).`, 'success');
+      } else {
+        state.vehicles = normalizeVehicleList(loadLocalVehicles());
+        renderAll();
+      }
+    } catch (err) {
+      state.connectionError = true;
+      state.connectionErrorDetail = formatFirebaseError(err);
+      renderSyncStatus();
+      showToast(state.connectionErrorDetail, 'error');
+    } finally {
+      refreshBtn.classList.remove('is-spinning');
+    }
+  }
+
+  async function firestoreSaveVehicle(vehicle) {
+    if (!db) {
+      const exists = state.vehicles.some((v) => v.id === vehicle.id);
+      state.vehicles = exists
+        ? state.vehicles.map((v) => (v.id === vehicle.id ? vehicle : v))
+        : [...state.vehicles, vehicle];
+      saveLocalVehicles(state.vehicles);
+      return;
+    }
+    await db.collection(getCollectionName()).doc(vehicle.id).set(vehicle, { merge: true });
+  }
+
+  async function firestoreDeleteVehicle(id) {
+    if (!db) {
+      state.vehicles = state.vehicles.filter((v) => v.id !== id);
+      saveLocalVehicles(state.vehicles);
+      return;
+    }
+    await db.collection(getCollectionName()).doc(id).delete();
+  }
+
+  async function firestoreClearAll() {
+    if (!db) {
+      state.vehicles = [];
+      localStorage.removeItem(STORAGE_KEYS.LOCAL_VEHICLES);
+      return;
+    }
+    const colRef = db.collection(getCollectionName());
+    const snapshot = await colRef.get();
+    const docs = snapshot.docs;
+    const CHUNK = 400;
+    for (let i = 0; i < docs.length; i += CHUNK) {
+      const batch = db.batch();
+      docs.slice(i, i + CHUNK).forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+    }
+    localStorage.removeItem(STORAGE_KEYS.LOCAL_VEHICLES);
+  }
+
+  async function firestoreBatchImport(vehicles) {
+    if (!db) {
+      state.vehicles = [...state.vehicles, ...vehicles];
+      saveLocalVehicles(state.vehicles);
+      return;
+    }
+    const colRef = db.collection(getCollectionName());
+    const CHUNK = 400;
+    for (let i = 0; i < vehicles.length; i += CHUNK) {
+      const batch = db.batch();
+      vehicles.slice(i, i + CHUNK).forEach((v) => {
+        batch.set(colRef.doc(v.id), v, { merge: true });
+      });
+      await batch.commit();
+    }
+  }
+
+  // ---------- Importação Opcional de Google Sheets (CSV -> Firebase) ----------
   function resolveGoogleSheetsCsvUrls(rawUrl) {
     const trimmed = String(rawUrl || '').trim();
     if (!trimmed) return [];
 
-    // 1. Link publicado na web (/spreadsheets/d/e/2PACX-.../pub...)
     if (/docs\.google\.com\/spreadsheets\/d\/e\//i.test(trimmed)) {
       let pubUrl = trimmed.replace(/\/pubhtml(\b|$)/i, '/pub');
       try {
@@ -254,7 +444,6 @@
       }
     }
 
-    // 2. Link normal de compartilhamento (/spreadsheets/d/<ID>/...)
     const idMatch = trimmed.match(/docs\.google\.com\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/i);
     if (idMatch) {
       const sheetId = idMatch[1];
@@ -262,13 +451,11 @@
       const gid = gidMatch ? gidMatch[1] : '';
       const gidParam = gid ? `&gid=${gid}` : '';
       return [
-        // export?format=csv preserva exatamente o texto exibido nas células (evita bugs de tipo da API gviz)
         `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv${gidParam}`,
         `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv${gidParam}`
       ];
     }
 
-    // 3. Qualquer URL CSV direta
     return [trimmed];
   }
 
@@ -388,7 +575,7 @@
     return map;
   }
 
-  // ---------- Correção automática de prefixos que o Google Sheets converte em data ----------
+  // ---------- Correção automática de prefixos que o Google Sheets converteu em data ----------
   function recoverPrefixFromDateParts(yearNum, monthNum, dayNum) {
     const currentYear = new Date().getFullYear();
     if (yearNum < 1930) {
@@ -405,20 +592,17 @@
     const str = String(raw || '').trim();
     if (!str) return '';
 
-    // 1. ISO date / timestamp: "1977-07-01", "1977-7-1", "1977-07-01T03:00:00.000Z", "1977-07-01 00:00:00"
     const isoMatch = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T\s].*)?$/);
     if (isoMatch) {
       return recoverPrefixFromDateParts(Number(isoMatch[1]), Number(isoMatch[2]), Number(isoMatch[3]));
     }
 
-    // 2. Data BR/US: "01/07/1977", "1/7/1977", "07/01/1977", com ou sem horário
     const slashMatch = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:\s.*)?$/);
     if (slashMatch) {
       const a = Number(slashMatch[1]);
       const b = Number(slashMatch[2]);
       let y = Number(slashMatch[3]);
       if (y < 100) y += y >= 30 ? 1900 : 2000;
-      // Se um dos lados for 1 (dia padrão gerado pelo Sheets para XX-M), o outro é o mês
       let dayNum = a;
       let monthNum = b;
       if (b === 1 && a >= 1 && a <= 12) {
@@ -431,7 +615,6 @@
       return recoverPrefixFromDateParts(y, monthNum, dayNum);
     }
 
-    // 3. Mês abreviado: "jul/77", "jul-1977", "jul. de 1977", "Fri Jul 01 1977 ..."
     const monthNames = {
       jan: 1, fev: 2, feb: 2, mar: 3, abr: 4, apr: 4, mai: 5, may: 5,
       jun: 6, jul: 7, ago: 8, aug: 8, set: 9, sep: 9, out: 10, oct: 10,
@@ -492,8 +675,9 @@
       const placaRaw = get('placa');
       if (!prefixo && !placaRaw) continue;
 
+      const safeKey = `${prefixo || placaRaw}-${placaRaw || i}`.replace(/[^a-zA-Z0-9_-]/g, '');
       vehicles.push({
-        id: get('id') || `vtr-sheet-${i}-${(prefixo || placaRaw).replace(/[^a-zA-Z0-9]/g, '')}`,
+        id: get('id') || `vtr-imp-${i}-${safeKey || Date.now()}`,
         prefixo: prefixo || placaRaw,
         placa: placaRaw ? formatPlate(placaRaw) : '',
         modelo: get('modelo'),
@@ -531,68 +715,7 @@
       }
     }
 
-    throw lastError || new Error('Não foi possível acessar a planilha.');
-  }
-
-  // ---------- Suporte opcional a Apps Script (caso seja usada URL /exec) ----------
-  async function apiListVehicles(url) {
-    const sep = url.includes('?') ? '&' : '?';
-    const res = await fetch(`${url}${sep}t=${Date.now()}`, {
-      method: 'GET',
-      redirect: 'follow'
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error || 'Erro ao ler planilha.');
-    return Array.isArray(data.vehicles) ? data.vehicles : [];
-  }
-
-  async function apiPost(payload) {
-    const url = getSheetUrl();
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'text/plain;charset=utf-8'
-      },
-      body: JSON.stringify(payload),
-      redirect: 'follow'
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error || 'Erro ao gravar na planilha.');
-    return data;
-  }
-
-  async function loadVehicles({ silent = false } = {}) {
-    state.loading = true;
-    state.connectionError = false;
-    renderSyncStatus();
-    if (!silent) renderBoard();
-
-    const refreshBtn = document.getElementById('btn-refresh');
-    refreshBtn.classList.add('is-spinning');
-
-    try {
-      const url = getSheetUrl();
-      if (url) {
-        if (isAppsScriptUrl(url)) {
-          state.vehicles = normalizeVehicleList(await apiListVehicles(url));
-        } else {
-          state.vehicles = normalizeVehicleList(await fetchGoogleSheetCSV(url));
-          saveLocalVehicles(state.vehicles);
-        }
-      } else {
-        state.vehicles = normalizeVehicleList(loadLocalVehicles());
-      }
-    } catch (err) {
-      state.connectionError = true;
-      state.vehicles = normalizeVehicleList(loadLocalVehicles());
-      showToast(`Erro ao sincronizar planilha: ${err.message}`, 'error');
-    } finally {
-      state.loading = false;
-      refreshBtn.classList.remove('is-spinning');
-      renderAll();
-    }
+    throw lastError || new Error('Não foi possível ler a planilha.');
   }
 
   // ---------- Escape de HTML ----------
@@ -624,7 +747,7 @@
       el.style.opacity = '0';
       el.style.transition = 'opacity 0.2s ease';
       setTimeout(() => el.remove(), 220);
-    }, 3600);
+    }, 3800);
   }
 
   // ---------- Renderização ----------
@@ -640,16 +763,16 @@
 
     pill.classList.remove('is-local', 'is-connected', 'is-error');
 
-    if (hasSheetConfigured()) {
-      if (state.connectionError) {
-        pill.classList.add('is-error');
-        label.textContent = 'Erro na planilha';
-      } else {
-        pill.classList.add('is-connected');
-        label.textContent = 'Google Sheets conectado';
-      }
+    if (state.connectionError) {
+      pill.classList.add('is-error');
+      label.textContent = 'Erro no Firebase';
+    } else if (state.firebaseConnected) {
+      pill.classList.add('is-connected');
+      label.textContent = 'Firebase online';
+    } else if (state.firebaseReady && state.loading) {
+      label.textContent = 'Conectando...';
     } else {
-      label.textContent = 'Google Sheets';
+      label.textContent = 'Armazenamento local';
     }
   }
 
@@ -833,7 +956,7 @@
       emptyEl.hidden = true;
       tableWrap.hidden = true;
       cardsWrap.hidden = true;
-      resultsCount.textContent = 'Sincronizando...';
+      resultsCount.textContent = 'Conectando ao Firebase...';
       return;
     }
 
@@ -846,7 +969,7 @@
       cardsWrap.hidden = true;
       emptyEl.hidden = false;
       document.getElementById('empty-title').textContent = 'Nenhuma viatura cadastrada';
-      document.getElementById('empty-desc').textContent = 'Cadastre uma viatura abaixo ou conecte sua planilha do Google Sheets no botão do topo.';
+      document.getElementById('empty-desc').textContent = 'Cadastre a primeira viatura abaixo — tudo fica salvo automaticamente no Firebase em tempo real.';
       const emptyBtn = document.getElementById('btn-empty-action');
       emptyBtn.textContent = 'Cadastrar primeira viatura';
       emptyBtn.dataset.emptyAction = 'new';
@@ -1045,32 +1168,17 @@
     saveBtn.textContent = 'Salvando...';
 
     try {
-      if (isWritableCloudMode()) {
-        const res = await apiPost({
-          action: isEdit ? 'update' : 'create',
-          vehicle: payload
-        });
-        const saved = res.vehicle || payload;
-        if (isEdit) {
-          state.vehicles = state.vehicles.map((v) => (v.id === saved.id ? saved : v));
-        } else {
-          state.vehicles.push(saved);
-        }
-        showToast(isEdit ? 'Viatura atualizada na planilha.' : 'Viatura salva na planilha.', 'success');
-      } else {
-        if (isEdit) {
-          state.vehicles = state.vehicles.map((v) => (v.id === payload.id ? payload : v));
-        } else {
-          state.vehicles.push(payload);
-        }
-        saveLocalVehicles(state.vehicles);
-        showToast(isEdit ? 'Viatura atualizada.' : 'Viatura cadastrada.', 'success');
-      }
-
+      await firestoreSaveVehicle(payload);
       closeVehicleDrawer();
-      renderAll();
+      if (!db) renderAll();
+      showToast(
+        db
+          ? (isEdit ? 'Viatura atualizada no Firebase.' : 'Viatura salva no Firebase.')
+          : (isEdit ? 'Viatura atualizada localmente.' : 'Viatura cadastrada localmente.'),
+        'success'
+      );
     } catch (err) {
-      showToast(`Erro ao salvar: ${err.message}`, 'error');
+      showToast(`Erro ao salvar: ${formatFirebaseError(err)}`, 'error');
     } finally {
       state.saving = false;
       saveBtn.disabled = false;
@@ -1134,20 +1242,13 @@
     btn.textContent = 'Salvando...';
 
     try {
-      if (isWritableCloudMode()) {
-        const res = await apiPost({ action: 'update', vehicle: updated });
-        const saved = res.vehicle || updated;
-        state.vehicles = state.vehicles.map((v) => (v.id === saved.id ? saved : v));
-      } else {
-        state.vehicles = state.vehicles.map((v) => (v.id === updated.id ? updated : v));
-        saveLocalVehicles(state.vehicles);
-      }
+      await firestoreSaveVehicle(updated);
       const sysLabel = SYSTEMS.find((s) => s.key === sysKey)?.label || '';
-      showToast(`${sysLabel} de ${vehicle.prefixo} renovado até ${formatDateBR(newDate)}.`, 'success');
       closeModal('renew-modal');
-      renderAll();
+      if (!db) renderAll();
+      showToast(`${sysLabel} de ${vehicle.prefixo} renovado até ${formatDateBR(newDate)}.`, 'success');
     } catch (err) {
-      showToast(`Erro ao renovar: ${err.message}`, 'error');
+      showToast(`Erro ao renovar: ${formatFirebaseError(err)}`, 'error');
     } finally {
       state.saving = false;
       btn.disabled = false;
@@ -1161,7 +1262,7 @@
     if (!vehicle) return;
     state.pendingDeleteId = vehicleId;
     document.getElementById('delete-message').textContent =
-      `Excluir a viatura ${vehicle.prefixo} (${formatPlate(vehicle.placa)})? Esta ação não pode ser desfeita.`;
+      `Excluir a viatura ${vehicle.prefixo} (${formatPlate(vehicle.placa)})? Esta ação remove o registro do Firebase e não pode ser desfeita.`;
     openModal('delete-modal');
   }
 
@@ -1175,18 +1276,12 @@
     btn.textContent = 'Excluindo...';
 
     try {
-      if (isWritableCloudMode()) {
-        await apiPost({ action: 'delete', id });
-      }
-      state.vehicles = state.vehicles.filter((v) => v.id !== id);
-      if (!isWritableCloudMode()) {
-        saveLocalVehicles(state.vehicles);
-      }
-      showToast('Viatura excluída.', 'success');
+      await firestoreDeleteVehicle(id);
       closeModal('delete-modal');
-      renderAll();
+      if (!db) renderAll();
+      showToast('Viatura excluída.', 'success');
     } catch (err) {
-      showToast(`Erro ao excluir: ${err.message}`, 'error');
+      showToast(`Erro ao excluir: ${formatFirebaseError(err)}`, 'error');
     } finally {
       state.saving = false;
       btn.disabled = false;
@@ -1200,48 +1295,33 @@
     const count = state.vehicles.length;
     if (count === 0) return;
 
-    document.getElementById('clear-all-message').textContent =
-      `Apagar todas as ${count} viatura(s) cadastradas para começar a digitar do zero?`;
+    document.getElementById('clear-all-message').textContent = db
+      ? `Apagar todas as ${count} viatura(s) salvas no Firebase para começar a digitar do zero?`
+      : `Apagar todas as ${count} viatura(s) cadastradas para começar a digitar do zero?`;
 
-    const hasCustomUrl = Boolean(localStorage.getItem(STORAGE_KEYS.CUSTOM_URL));
-    const disconnectWrap = document.getElementById('clear-all-disconnect-wrap');
-    const disconnectChk = document.getElementById('clear-all-disconnect');
-    disconnectWrap.hidden = !hasCustomUrl;
-    disconnectChk.checked = hasCustomUrl;
-
+    document.getElementById('clear-all-disconnect-wrap').hidden = true;
     openModal('clear-all-modal');
   }
 
   async function handleConfirmClearAll() {
     if (state.saving) return;
     const btn = document.getElementById('btn-confirm-clear-all');
-    const disconnectChk = document.getElementById('clear-all-disconnect');
-    const shouldDisconnect = !document.getElementById('clear-all-disconnect-wrap').hidden && disconnectChk.checked;
 
     state.saving = true;
     btn.disabled = true;
     btn.textContent = 'Limpando...';
 
     try {
-      if (isWritableCloudMode() && !shouldDisconnect) {
-        await apiPost({ action: 'clear_all' });
-      }
-      if (shouldDisconnect) {
-        localStorage.removeItem(STORAGE_KEYS.CUSTOM_URL);
-      }
-      localStorage.removeItem(STORAGE_KEYS.LOCAL_VEHICLES);
-      state.vehicles = [];
+      await firestoreClearAll();
       state.statusFilter = 'all';
       state.systemFilter = 'all';
       state.search = '';
-      state.connectionError = false;
       document.getElementById('search-input').value = '';
-
       closeModal('clear-all-modal');
-      renderAll();
+      if (!db) renderAll();
       showToast('Tudo limpo! Pronto para cadastrar do zero.', 'success');
     } catch (err) {
-      showToast(`Erro ao limpar tudo: ${err.message}`, 'error');
+      showToast(`Erro ao limpar tudo: ${formatFirebaseError(err)}`, 'error');
     } finally {
       state.saving = false;
       btn.disabled = false;
@@ -1249,101 +1329,69 @@
     }
   }
 
-  // ---------- Modal: Sincronizar com Google Sheets ----------
-  function openSheetsModal() {
-    const url = getSheetUrl();
-    const connected = Boolean(url);
-    const cfg = window.FLEET_CONFIG || {};
-    const fixedInConfig = Boolean(cfg.GOOGLE_SHEETS_URL || cfg.APPS_SCRIPT_URL);
-
-    document.getElementById('sheets-url-input').value = url;
-    document.getElementById('alert-days-input').value = getAlertDays();
-
+  // ---------- Modal: Status do Firebase & Importação ----------
+  function openDatabaseModal() {
+    const fbCfg = getFirebaseConfig();
     const badge = document.getElementById('modal-conn-badge');
     const desc = document.getElementById('modal-conn-desc');
-    const disconnectBtn = document.getElementById('btn-disconnect-sheets');
 
-    badge.textContent = connected ? 'Planilha conectada' : 'Sem planilha conectada';
-    badge.classList.toggle('is-connected', connected);
-    desc.textContent = connected
-      ? 'Ao abrir a página ou clicar em Atualizar (↻), os dados são puxados automaticamente do Google Sheets.'
-      : 'Cole o link da sua planilha do Google Sheets abaixo para carregar as viaturas automaticamente.';
+    document.getElementById('alert-days-input').value = getAlertDays();
 
-    disconnectBtn.hidden = !connected || fixedInConfig;
+    badge.classList.remove('is-connected');
+    if (state.connectionError) {
+      badge.textContent = 'Erro de conexão';
+      desc.textContent = state.connectionErrorDetail || 'Não foi possível conectar ao Firebase Firestore.';
+    } else if (state.firebaseConnected && fbCfg) {
+      badge.textContent = `Firebase online · ${fbCfg.projectId}`;
+      badge.classList.add('is-connected');
+      desc.textContent = `Coleção "${getCollectionName()}" sincronizada em tempo real. Todos os cadastros, renovações e observações ficam salvos automaticamente.`;
+    } else {
+      badge.textContent = 'Armazenamento local';
+      desc.textContent = 'Firebase não configurado ou sem conexão com a internet.';
+    }
+
     openModal('sheets-modal');
   }
 
-  async function handleSaveSheetsConfig(e) {
+  function handleSaveSettings(e) {
     e.preventDefault();
-    const urlInput = document.getElementById('sheets-url-input').value.trim();
     const daysVal = parseInt(document.getElementById('alert-days-input').value, 10);
-
     if (!Number.isNaN(daysVal) && daysVal >= 1 && daysVal <= 180) {
       localStorage.setItem(STORAGE_KEYS.ALERT_DAYS, String(daysVal));
     }
-
-    const btn = document.getElementById('btn-save-sheets');
-    btn.disabled = true;
-    btn.textContent = 'Sincronizando...';
-
-    try {
-      if (urlInput) {
-        if (!/^https?:\/\//i.test(urlInput)) {
-          showToast('Cole um link válido começando com https://', 'warning');
-          return;
-        }
-        const vehicles = normalizeVehicleList(
-          isAppsScriptUrl(urlInput)
-            ? await apiListVehicles(urlInput)
-            : await fetchGoogleSheetCSV(urlInput)
-        );
-
-        localStorage.setItem(STORAGE_KEYS.CUSTOM_URL, urlInput);
-        state.vehicles = vehicles;
-        state.connectionError = false;
-        saveLocalVehicles(vehicles);
-        renderAll();
-        showToast(`Sincronizado com o Google Sheets! ${vehicles.length} viatura(s) carregada(s).`, 'success');
-      } else {
-        localStorage.removeItem(STORAGE_KEYS.CUSTOM_URL);
-        state.connectionError = false;
-        renderAll();
-        showToast('Configurações salvas.', 'success');
-      }
-      closeModal('sheets-modal');
-    } catch (err) {
-      showToast(`Não foi possível ler a planilha: ${err.message}`, 'error');
-    } finally {
-      btn.disabled = false;
-      btn.textContent = 'Sincronizar agora';
-    }
+    closeModal('sheets-modal');
+    renderAll();
+    showToast(`Alerta amarelo configurado para ${getAlertDays()} dias.`, 'success');
   }
 
-  function downloadTemplateCSV() {
-    const headers = [
-      'Prefixo',
-      'Placa',
-      'Modelo',
-      'Unidade',
-      'Venc. Dielétrico',
-      'Laudo Dielétrico',
-      'Venc. Tacógrafo',
-      'Cert. Tacógrafo',
-      'Venc. Acústico',
-      'Laudo Acústico',
-      'Observações'
-    ];
-    const csvContent = '\uFEFF' + headers.join(';') + '\r\n';
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'modelo-planilha-viaturas.csv';
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    showToast('Modelo de planilha baixado! Importe no Google Sheets.', 'success');
+  async function handleImportSheetToFirebase() {
+    const urlInput = document.getElementById('sheets-url-input').value.trim();
+    if (!urlInput) {
+      showToast('Cole o link da planilha do Google Sheets acima antes de importar.', 'warning');
+      return;
+    }
+
+    const btn = document.getElementById('btn-import-sheet-to-firebase');
+    btn.disabled = true;
+    btn.textContent = 'Importando...';
+
+    try {
+      const vehicles = await fetchGoogleSheetCSV(urlInput);
+      if (vehicles.length === 0) {
+        showToast('Nenhuma viatura encontrada na planilha informada.', 'warning');
+        return;
+      }
+      await firestoreBatchImport(vehicles);
+      document.getElementById('sheets-url-input').value = '';
+      closeModal('sheets-modal');
+      if (!db) renderAll();
+      showToast(`${vehicles.length} viatura(s) importada(s) e salva(s) no Firebase!`, 'success');
+    } catch (err) {
+      showToast(`Erro ao importar planilha: ${err.message}`, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Importar para o Firebase';
+    }
   }
 
   // ---------- Helpers de Modal ----------
@@ -1513,8 +1561,8 @@
     });
 
     document.getElementById('btn-new-vehicle').addEventListener('click', () => openVehicleDrawer(null));
-    document.getElementById('btn-refresh').addEventListener('click', () => loadVehicles());
-    document.getElementById('btn-sheets-status').addEventListener('click', openSheetsModal);
+    document.getElementById('btn-refresh').addEventListener('click', manualRefresh);
+    document.getElementById('btn-sheets-status').addEventListener('click', openDatabaseModal);
 
     // Filtros do Semáforo
     document.querySelectorAll('.signal-card').forEach((card) => {
@@ -1639,16 +1687,9 @@
     document.getElementById('btn-clear-all').addEventListener('click', openClearAllModal);
     document.getElementById('btn-confirm-clear-all').addEventListener('click', handleConfirmClearAll);
 
-    // Modal Google Sheets
-    document.getElementById('sheets-form').addEventListener('submit', handleSaveSheetsConfig);
-    document.getElementById('btn-download-template').addEventListener('click', downloadTemplateCSV);
-    document.getElementById('btn-disconnect-sheets').addEventListener('click', () => {
-      localStorage.removeItem(STORAGE_KEYS.CUSTOM_URL);
-      state.connectionError = false;
-      closeModal('sheets-modal');
-      renderAll();
-      showToast('Planilha desconectada.', 'info');
-    });
+    // Modal Firebase & Importação
+    document.getElementById('sheets-form').addEventListener('submit', handleSaveSettings);
+    document.getElementById('btn-import-sheet-to-firebase').addEventListener('click', handleImportSheetToFirebase);
 
     // Fechar modais via botão ou clique no backdrop
     document.querySelectorAll('[data-close-modal]').forEach((btn) => {
@@ -1675,7 +1716,7 @@
       document.getElementById('fleet-title').textContent = window.FLEET_CONFIG.FLEET_TITLE;
     }
     bindEvents();
-    loadVehicles();
+    initFirebase();
   }
 
   document.addEventListener('DOMContentLoaded', init);
