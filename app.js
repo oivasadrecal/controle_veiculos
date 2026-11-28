@@ -28,8 +28,7 @@
     renewTarget: null        // { vehicleId, sysKey, activeMonths }
   };
 
-  let db = null;
-  let unsubscribeSnapshot = null;
+  let autoSyncTimer = null;
 
   // ---------- Helpers de Configuração ----------
   function getFirebaseConfig() {
@@ -40,6 +39,11 @@
   function getCollectionName() {
     const cfg = window.FLEET_CONFIG || {};
     return (cfg.FIRESTORE_COLLECTION || 'viaturas').trim();
+  }
+
+  function hasFirebaseConfigured() {
+    const fb = getFirebaseConfig();
+    return Boolean(fb && fb.projectId && fb.apiKey);
   }
 
   function getAlertDays() {
@@ -231,186 +235,126 @@
     }
   }
 
-  // ---------- Firebase Firestore (Tempo Real) ----------
+  // ---------- Firebase Firestore via API REST Oficial (HTTP padrão, sem bloqueio WebChannel) ----------
+  const VEHICLE_FIELDS = [
+    'id', 'prefixo', 'placa', 'modelo', 'unidade',
+    'dieletrico_vencimento', 'dieletrico_laudo',
+    'tacografo_vencimento', 'tacografo_laudo',
+    'acustico_vencimento', 'acustico_laudo',
+    'observacoes', 'atualizado_em'
+  ];
+
+  function firestoreBaseDocRoot() {
+    const fb = getFirebaseConfig();
+    return `projects/${fb.projectId}/databases/(default)/documents`;
+  }
+
+  function firestoreRestUrl(subpath = '', extraQuery = '') {
+    const fb = getFirebaseConfig();
+    const base = `https://firestore.googleapis.com/v1/${firestoreBaseDocRoot()}${subpath}`;
+    const sep = extraQuery ? `?${extraQuery}&key=${encodeURIComponent(fb.apiKey)}` : `?key=${encodeURIComponent(fb.apiKey)}`;
+    return `${base}${sep}`;
+  }
+
+  function vehicleToFirestoreFields(v) {
+    const fields = {};
+    for (const k of VEHICLE_FIELDS) {
+      fields[k] = { stringValue: String(v[k] ?? '').trim() };
+    }
+    return fields;
+  }
+
+  function readFirestoreField(fieldObj) {
+    if (!fieldObj || typeof fieldObj !== 'object') return '';
+    if ('stringValue' in fieldObj) return String(fieldObj.stringValue);
+    if ('integerValue' in fieldObj) return String(fieldObj.integerValue);
+    if ('doubleValue' in fieldObj) return String(fieldObj.doubleValue);
+    if ('timestampValue' in fieldObj) return String(fieldObj.timestampValue);
+    if ('booleanValue' in fieldObj) return String(fieldObj.booleanValue);
+    return '';
+  }
+
+  function firestoreDocToVehicle(doc) {
+    const f = doc.fields || {};
+    const nameParts = String(doc.name || '').split('/');
+    const docId = decodeURIComponent(nameParts[nameParts.length - 1] || '') || readFirestoreField(f.id);
+    return {
+      id: docId,
+      prefixo: sanitizePrefixo(readFirestoreField(f.prefixo)),
+      placa: readFirestoreField(f.placa).trim(),
+      modelo: readFirestoreField(f.modelo).trim(),
+      unidade: readFirestoreField(f.unidade).trim(),
+      dieletrico_vencimento: normalizeFlexibleDate(readFirestoreField(f.dieletrico_vencimento)),
+      dieletrico_laudo: readFirestoreField(f.dieletrico_laudo).trim(),
+      tacografo_vencimento: normalizeFlexibleDate(readFirestoreField(f.tacografo_vencimento)),
+      tacografo_laudo: readFirestoreField(f.tacografo_laudo).trim(),
+      acustico_vencimento: normalizeFlexibleDate(readFirestoreField(f.acustico_vencimento)),
+      acustico_laudo: readFirestoreField(f.acustico_laudo).trim(),
+      observacoes: readFirestoreField(f.observacoes).trim(),
+      atualizado_em: readFirestoreField(f.atualizado_em).trim()
+    };
+  }
+
+  async function parseFirestoreResponse(res) {
+    const text = await res.text();
+    let json = {};
+    if (text) {
+      try { json = JSON.parse(text); } catch (_) { json = { raw: text }; }
+    }
+    if (!res.ok) {
+      const apiErr = (json && json.error) || {};
+      const status = apiErr.status || `HTTP_${res.status}`;
+      const detail = apiErr.message || text || `HTTP ${res.status}`;
+      const err = new Error(detail);
+      err.httpStatus = res.status;
+      err.code = status;
+      throw err;
+    }
+    return json;
+  }
+
   function formatFirebaseError(err) {
-    const code = err && err.code ? String(err.code) : '';
+    const status = err && err.httpStatus ? Number(err.httpStatus) : 0;
+    const code = err && err.code ? String(err.code).toUpperCase() : '';
     const msg = err && err.message ? String(err.message) : String(err || '');
-    if (code === 'permission-denied') {
-      return 'Permissão negada no Firestore. Vá no Console do Firebase > Firestore Database > Regras e libere read, write.';
+
+    if (status === 403 || code === 'PERMISSION_DENIED') {
+      return 'Permissão negada no Firebase (403). No Console do Firebase > Firestore Database > Regras, publique "allow read, write: if true;".';
     }
-    if (code === 'not-found' || /database .* does not exist/i.test(msg)) {
-      return 'O banco Firestore Database ainda não foi criado neste projeto Firebase. Crie em Criação > Firestore Database.';
+    if (status === 404 || code === 'NOT_FOUND') {
+      return 'Banco (default) do Firestore não encontrado (404). Verifique no Console do Firebase > Firestore Database.';
     }
-    if (code === 'unavailable' || /offline/i.test(msg)) {
-      return 'Não foi possível alcançar o servidor do Firebase. Verifique sua internet ou se o Firestore Database foi criado.';
+    if (/failed to fetch|networkerror/i.test(msg)) {
+      return 'Falha de rede ao acessar firestore.googleapis.com. Verifique sua internet ou se há bloqueador/proxy bloqueando Google APIs.';
     }
     return msg || 'Erro desconhecido no Firebase';
   }
 
-  function withTimeout(promise, ms, timeoutMessage) {
-    let timerId;
-    const timeoutPromise = new Promise((_, reject) => {
-      timerId = setTimeout(() => reject(new Error(timeoutMessage)), ms);
-    });
-    return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timerId));
-  }
+  async function firestoreListVehicles() {
+    const collection = encodeURIComponent(getCollectionName());
+    const all = [];
+    let pageToken = '';
 
-  function initFirebase() {
-    const fbCfg = getFirebaseConfig();
-    if (!fbCfg || typeof window.firebase === 'undefined') {
-      state.firebaseReady = false;
-      state.loading = false;
-      state.vehicles = normalizeVehicleList(loadLocalVehicles());
-      renderAll();
-      return;
-    }
-
-    try {
-      if (!window.firebase.apps.length) {
-        window.firebase.initializeApp(fbCfg);
-      }
-      db = window.firebase.firestore();
-      // Evita travamentos silenciosos de gravação em redes/firewalls que bloqueiam WebChannel
-      db.settings({ experimentalAutoDetectLongPolling: true, merge: true });
-      state.firebaseReady = true;
-      subscribeFirestore();
-    } catch (err) {
-      state.firebaseReady = false;
-      state.connectionError = true;
-      state.connectionErrorDetail = formatFirebaseError(err);
-      state.loading = false;
-      state.vehicles = normalizeVehicleList(loadLocalVehicles());
-      renderAll();
-      showToast(`Erro ao iniciar Firebase: ${state.connectionErrorDetail}`, 'error');
-    }
-  }
-
-  function subscribeFirestore() {
-    if (!db) return;
-    if (unsubscribeSnapshot) {
-      unsubscribeSnapshot();
-      unsubscribeSnapshot = null;
-    }
-
-    state.loading = true;
-    state.firebaseConnected = false;
-    state.connectionError = false;
-    renderAll();
-
-    // Testa conexão REAL com o servidor do Firebase (não confia apenas no cache vazio)
-    withTimeout(
-      db.collection(getCollectionName()).limit(1).get({ source: 'server' }),
-      12000,
-      'Tempo esgotado ao conectar no servidor do Firebase. Verifique se o Firestore Database foi criado no Console do Firebase.'
-    ).then(() => {
-      state.firebaseConnected = true;
-      state.connectionError = false;
-      state.connectionErrorDetail = '';
-      renderSyncStatus();
-    }).catch((err) => {
-      state.firebaseConnected = false;
-      state.connectionError = true;
-      state.connectionErrorDetail = formatFirebaseError(err);
-      state.loading = false;
-      renderAll();
-      showToast(state.connectionErrorDetail, 'error');
-    });
-
-    unsubscribeSnapshot = db.collection(getCollectionName()).onSnapshot(
-      { includeMetadataChanges: true },
-      (snapshot) => {
-        const fromServer = !snapshot.metadata.fromCache;
-        const list = [];
-        snapshot.forEach((doc) => {
-          const data = doc.data() || {};
-          list.push({
-            id: doc.id,
-            prefixo: sanitizePrefixo(data.prefixo || ''),
-            placa: String(data.placa || '').trim(),
-            modelo: String(data.modelo || '').trim(),
-            unidade: String(data.unidade || '').trim(),
-            dieletrico_vencimento: normalizeFlexibleDate(data.dieletrico_vencimento || ''),
-            dieletrico_laudo: String(data.dieletrico_laudo || '').trim(),
-            tacografo_vencimento: normalizeFlexibleDate(data.tacografo_vencimento || ''),
-            tacografo_laudo: String(data.tacografo_laudo || '').trim(),
-            acustico_vencimento: normalizeFlexibleDate(data.acustico_vencimento || ''),
-            acustico_laudo: String(data.acustico_laudo || '').trim(),
-            observacoes: String(data.observacoes || '').trim(),
-            atualizado_em: String(data.atualizado_em || '')
-          });
-        });
-
-        state.vehicles = list;
-        if (fromServer) {
-          state.firebaseConnected = true;
-          state.connectionError = false;
-          state.connectionErrorDetail = '';
+    do {
+      const query = pageToken
+        ? `pageSize=300&pageToken=${encodeURIComponent(pageToken)}`
+        : 'pageSize=300';
+      const url = firestoreRestUrl(`/${collection}`, query);
+      const res = await fetch(url, { method: 'GET', cache: 'no-store' });
+      const data = await parseFirestoreResponse(res);
+      if (Array.isArray(data.documents)) {
+        for (const doc of data.documents) {
+          all.push(firestoreDocToVehicle(doc));
         }
-        state.loading = false;
-        saveLocalVehicles(list);
-        renderAll();
-      },
-      (err) => {
-        state.firebaseConnected = false;
-        state.connectionError = true;
-        state.connectionErrorDetail = formatFirebaseError(err);
-        state.loading = false;
-        state.vehicles = normalizeVehicleList(loadLocalVehicles());
-        renderAll();
-        showToast(state.connectionErrorDetail, 'error');
       }
-    );
-  }
+      pageToken = data.nextPageToken || '';
+    } while (pageToken);
 
-  async function manualRefresh() {
-    const refreshBtn = document.getElementById('btn-refresh');
-    refreshBtn.classList.add('is-spinning');
-
-    try {
-      if (db) {
-        const snapshot = await db.collection(getCollectionName()).get({ source: 'server' });
-        const list = [];
-        snapshot.forEach((doc) => {
-          const data = doc.data() || {};
-          list.push({
-            id: doc.id,
-            prefixo: sanitizePrefixo(data.prefixo || ''),
-            placa: String(data.placa || '').trim(),
-            modelo: String(data.modelo || '').trim(),
-            unidade: String(data.unidade || '').trim(),
-            dieletrico_vencimento: normalizeFlexibleDate(data.dieletrico_vencimento || ''),
-            dieletrico_laudo: String(data.dieletrico_laudo || '').trim(),
-            tacografo_vencimento: normalizeFlexibleDate(data.tacografo_vencimento || ''),
-            tacografo_laudo: String(data.tacografo_laudo || '').trim(),
-            acustico_vencimento: normalizeFlexibleDate(data.acustico_vencimento || ''),
-            acustico_laudo: String(data.acustico_laudo || '').trim(),
-            observacoes: String(data.observacoes || '').trim(),
-            atualizado_em: String(data.atualizado_em || '')
-          });
-        });
-        state.vehicles = list;
-        state.firebaseConnected = true;
-        state.connectionError = false;
-        state.connectionErrorDetail = '';
-        saveLocalVehicles(list);
-        renderAll();
-        showToast(`Sincronizado com Firebase (${list.length} viatura(s)).`, 'success');
-      } else {
-        state.vehicles = normalizeVehicleList(loadLocalVehicles());
-        renderAll();
-      }
-    } catch (err) {
-      state.connectionError = true;
-      state.connectionErrorDetail = formatFirebaseError(err);
-      renderSyncStatus();
-      showToast(state.connectionErrorDetail, 'error');
-    } finally {
-      refreshBtn.classList.remove('is-spinning');
-    }
+    return all;
   }
 
   async function firestoreSaveVehicle(vehicle) {
-    if (!db) {
+    if (!hasFirebaseConfigured()) {
       const exists = state.vehicles.some((v) => v.id === vehicle.id);
       state.vehicles = exists
         ? state.vehicles.map((v) => (v.id === vehicle.id ? vehicle : v))
@@ -418,67 +362,148 @@
       saveLocalVehicles(state.vehicles);
       return;
     }
-    await withTimeout(
-      db.collection(getCollectionName()).doc(vehicle.id).set(vehicle, { merge: true }),
-      12000,
-      'O Firebase não confirmou o salvamento em 12 segundos. Verifique sua conexão e as Regras do Firestore.'
-    );
+    const collection = encodeURIComponent(getCollectionName());
+    const docId = encodeURIComponent(vehicle.id);
+    const url = firestoreRestUrl(`/${collection}/${docId}`);
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fields: vehicleToFirestoreFields(vehicle) })
+    });
+    const savedDoc = await parseFirestoreResponse(res);
+    const saved = firestoreDocToVehicle(savedDoc);
+
+    const exists = state.vehicles.some((v) => v.id === saved.id);
+    state.vehicles = exists
+      ? state.vehicles.map((v) => (v.id === saved.id ? saved : v))
+      : [...state.vehicles, saved];
+    saveLocalVehicles(state.vehicles);
   }
 
   async function firestoreDeleteVehicle(id) {
-    if (!db) {
+    if (!hasFirebaseConfigured()) {
       state.vehicles = state.vehicles.filter((v) => v.id !== id);
       saveLocalVehicles(state.vehicles);
       return;
     }
-    await withTimeout(
-      db.collection(getCollectionName()).doc(id).delete(),
-      12000,
-      'O Firebase não confirmou a exclusão em 12 segundos. Verifique sua conexão e as Regras do Firestore.'
-    );
+    const collection = encodeURIComponent(getCollectionName());
+    const docId = encodeURIComponent(id);
+    const url = firestoreRestUrl(`/${collection}/${docId}`);
+    const res = await fetch(url, { method: 'DELETE' });
+    await parseFirestoreResponse(res);
+
+    state.vehicles = state.vehicles.filter((v) => v.id !== id);
+    saveLocalVehicles(state.vehicles);
+  }
+
+  async function firestoreCommitWrites(writes) {
+    const CHUNK = 400;
+    const url = firestoreRestUrl(':commit');
+    for (let i = 0; i < writes.length; i += CHUNK) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ writes: writes.slice(i, i + CHUNK) })
+      });
+      await parseFirestoreResponse(res);
+    }
   }
 
   async function firestoreClearAll() {
-    if (!db) {
+    if (!hasFirebaseConfigured()) {
       state.vehicles = [];
       localStorage.removeItem(STORAGE_KEYS.LOCAL_VEHICLES);
       return;
     }
-    const colRef = db.collection(getCollectionName());
-    const snapshot = await withTimeout(
-      colRef.get({ source: 'server' }),
-      12000,
-      'O Firebase não respondeu ao limpar os dados.'
-    );
-    const docs = snapshot.docs;
-    const CHUNK = 400;
-    for (let i = 0; i < docs.length; i += CHUNK) {
-      const batch = db.batch();
-      docs.slice(i, i + CHUNK).forEach((d) => batch.delete(d.ref));
-      await withTimeout(batch.commit(), 15000, 'Tempo esgotado ao apagar registros no Firebase.');
+    const current = await firestoreListVehicles();
+    const docRoot = firestoreBaseDocRoot();
+    const collection = getCollectionName();
+    const writes = current.map((v) => ({
+      delete: `${docRoot}/${collection}/${v.id}`
+    }));
+    if (writes.length > 0) {
+      await firestoreCommitWrites(writes);
     }
+    state.vehicles = [];
     localStorage.removeItem(STORAGE_KEYS.LOCAL_VEHICLES);
   }
 
   async function firestoreBatchImport(vehicles) {
-    if (!db) {
+    if (!hasFirebaseConfigured()) {
       state.vehicles = [...state.vehicles, ...vehicles];
       saveLocalVehicles(state.vehicles);
       return;
     }
-    const colRef = db.collection(getCollectionName());
-    const CHUNK = 400;
-    for (let i = 0; i < vehicles.length; i += CHUNK) {
-      const batch = db.batch();
-      vehicles.slice(i, i + CHUNK).forEach((v) => {
-        batch.set(colRef.doc(v.id), v, { merge: true });
-      });
-      await withTimeout(
-        batch.commit(),
-        15000,
-        'O Firebase não confirmou a importação. Verifique as Regras do Firestore Database.'
-      );
+    const docRoot = firestoreBaseDocRoot();
+    const collection = getCollectionName();
+    const writes = vehicles.map((v) => ({
+      update: {
+        name: `${docRoot}/${collection}/${v.id}`,
+        fields: vehicleToFirestoreFields(v)
+      }
+    }));
+    await firestoreCommitWrites(writes);
+    state.vehicles = await firestoreListVehicles();
+    saveLocalVehicles(state.vehicles);
+  }
+
+  async function syncFromFirebase({ showLoading = false, showSuccessToast = false } = {}) {
+    if (!hasFirebaseConfigured()) {
+      state.firebaseReady = false;
+      state.firebaseConnected = false;
+      state.loading = false;
+      state.vehicles = normalizeVehicleList(loadLocalVehicles());
+      renderAll();
+      return;
     }
+
+    state.firebaseReady = true;
+    if (showLoading) {
+      state.loading = true;
+      renderAll();
+    }
+
+    const refreshBtn = document.getElementById('btn-refresh');
+    refreshBtn.classList.add('is-spinning');
+
+    try {
+      const list = await firestoreListVehicles();
+      state.vehicles = list;
+      state.firebaseConnected = true;
+      state.connectionError = false;
+      state.connectionErrorDetail = '';
+      saveLocalVehicles(list);
+      if (showSuccessToast) {
+        showToast(`Sincronizado com Firebase (${list.length} viatura(s)).`, 'success');
+      }
+    } catch (err) {
+      state.firebaseConnected = false;
+      state.connectionError = true;
+      state.connectionErrorDetail = formatFirebaseError(err);
+      if (showLoading) {
+        state.vehicles = normalizeVehicleList(loadLocalVehicles());
+      }
+      showToast(state.connectionErrorDetail, 'error');
+    } finally {
+      state.loading = false;
+      refreshBtn.classList.remove('is-spinning');
+      renderAll();
+    }
+  }
+
+  function initFirebase() {
+    syncFromFirebase({ showLoading: true, showSuccessToast: false });
+    if (autoSyncTimer) clearInterval(autoSyncTimer);
+    // Sincroniza automaticamente a cada 30 segundos em segundo plano
+    autoSyncTimer = setInterval(() => {
+      if (!state.saving && document.visibilityState === 'visible') {
+        syncFromFirebase({ showLoading: false, showSuccessToast: false });
+      }
+    }, 30000);
+  }
+
+  function manualRefresh() {
+    syncFromFirebase({ showLoading: false, showSuccessToast: true });
   }
 
   // ---------- Importação Opcional de Google Sheets (CSV -> Firebase) ----------
@@ -1224,9 +1249,9 @@
     try {
       await firestoreSaveVehicle(payload);
       closeVehicleDrawer();
-      if (!db) renderAll();
+      renderAll();
       showToast(
-        db
+        hasFirebaseConfigured()
           ? (isEdit ? 'Viatura atualizada no Firebase.' : 'Viatura salva no Firebase.')
           : (isEdit ? 'Viatura atualizada localmente.' : 'Viatura cadastrada localmente.'),
         'success'
@@ -1299,7 +1324,7 @@
       await firestoreSaveVehicle(updated);
       const sysLabel = SYSTEMS.find((s) => s.key === sysKey)?.label || '';
       closeModal('renew-modal');
-      if (!db) renderAll();
+      renderAll();
       showToast(`${sysLabel} de ${vehicle.prefixo} renovado até ${formatDateBR(newDate)}.`, 'success');
     } catch (err) {
       showToast(`Erro ao renovar: ${formatFirebaseError(err)}`, 'error');
@@ -1332,7 +1357,7 @@
     try {
       await firestoreDeleteVehicle(id);
       closeModal('delete-modal');
-      if (!db) renderAll();
+      renderAll();
       showToast('Viatura excluída.', 'success');
     } catch (err) {
       showToast(`Erro ao excluir: ${formatFirebaseError(err)}`, 'error');
@@ -1349,7 +1374,7 @@
     const count = state.vehicles.length;
     if (count === 0) return;
 
-    document.getElementById('clear-all-message').textContent = db
+    document.getElementById('clear-all-message').textContent = hasFirebaseConfigured()
       ? `Apagar todas as ${count} viatura(s) salvas no Firebase para começar a digitar do zero?`
       : `Apagar todas as ${count} viatura(s) cadastradas para começar a digitar do zero?`;
 
@@ -1372,7 +1397,7 @@
       state.search = '';
       document.getElementById('search-input').value = '';
       closeModal('clear-all-modal');
-      if (!db) renderAll();
+      renderAll();
       showToast('Tudo limpo! Pronto para cadastrar do zero.', 'success');
     } catch (err) {
       showToast(`Erro ao limpar tudo: ${formatFirebaseError(err)}`, 'error');
@@ -1438,7 +1463,7 @@
       await firestoreBatchImport(vehicles);
       document.getElementById('sheets-url-input').value = '';
       closeModal('sheets-modal');
-      if (!db) renderAll();
+      renderAll();
       showToast(`${vehicles.length} viatura(s) importada(s) e salva(s) no Firebase!`, 'success');
     } catch (err) {
       showToast(`Erro ao importar planilha: ${err.message}`, 'error');
