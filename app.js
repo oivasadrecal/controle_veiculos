@@ -234,13 +234,25 @@
   // ---------- Firebase Firestore (Tempo Real) ----------
   function formatFirebaseError(err) {
     const code = err && err.code ? String(err.code) : '';
+    const msg = err && err.message ? String(err.message) : String(err || '');
     if (code === 'permission-denied') {
-      return 'Permissão negada no Firestore. No Console do Firebase > Firestore Database > Regras, verifique se leitura/escrita estão liberadas.';
+      return 'Permissão negada no Firestore. Vá no Console do Firebase > Firestore Database > Regras e libere read, write.';
     }
-    if (code === 'unavailable') {
-      return 'Sem conexão com o Firebase no momento. Verifique sua internet.';
+    if (code === 'not-found' || /database .* does not exist/i.test(msg)) {
+      return 'O banco Firestore Database ainda não foi criado neste projeto Firebase. Crie em Criação > Firestore Database.';
     }
-    return (err && err.message) ? err.message : String(err || 'Erro desconhecido no Firebase');
+    if (code === 'unavailable' || /offline/i.test(msg)) {
+      return 'Não foi possível alcançar o servidor do Firebase. Verifique sua internet ou se o Firestore Database foi criado.';
+    }
+    return msg || 'Erro desconhecido no Firebase';
+  }
+
+  function withTimeout(promise, ms, timeoutMessage) {
+    let timerId;
+    const timeoutPromise = new Promise((_, reject) => {
+      timerId = setTimeout(() => reject(new Error(timeoutMessage)), ms);
+    });
+    return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timerId));
   }
 
   function initFirebase() {
@@ -258,6 +270,8 @@
         window.firebase.initializeApp(fbCfg);
       }
       db = window.firebase.firestore();
+      // Evita travamentos silenciosos de gravação em redes/firewalls que bloqueiam WebChannel
+      db.settings({ experimentalAutoDetectLongPolling: true, merge: true });
       state.firebaseReady = true;
       subscribeFirestore();
     } catch (err) {
@@ -279,11 +293,33 @@
     }
 
     state.loading = true;
+    state.firebaseConnected = false;
     state.connectionError = false;
     renderAll();
 
+    // Testa conexão REAL com o servidor do Firebase (não confia apenas no cache vazio)
+    withTimeout(
+      db.collection(getCollectionName()).limit(1).get({ source: 'server' }),
+      12000,
+      'Tempo esgotado ao conectar no servidor do Firebase. Verifique se o Firestore Database foi criado no Console do Firebase.'
+    ).then(() => {
+      state.firebaseConnected = true;
+      state.connectionError = false;
+      state.connectionErrorDetail = '';
+      renderSyncStatus();
+    }).catch((err) => {
+      state.firebaseConnected = false;
+      state.connectionError = true;
+      state.connectionErrorDetail = formatFirebaseError(err);
+      state.loading = false;
+      renderAll();
+      showToast(state.connectionErrorDetail, 'error');
+    });
+
     unsubscribeSnapshot = db.collection(getCollectionName()).onSnapshot(
+      { includeMetadataChanges: true },
       (snapshot) => {
+        const fromServer = !snapshot.metadata.fromCache;
         const list = [];
         snapshot.forEach((doc) => {
           const data = doc.data() || {};
@@ -305,9 +341,11 @@
         });
 
         state.vehicles = list;
-        state.firebaseConnected = true;
-        state.connectionError = false;
-        state.connectionErrorDetail = '';
+        if (fromServer) {
+          state.firebaseConnected = true;
+          state.connectionError = false;
+          state.connectionErrorDetail = '';
+        }
         state.loading = false;
         saveLocalVehicles(list);
         renderAll();
@@ -380,7 +418,11 @@
       saveLocalVehicles(state.vehicles);
       return;
     }
-    await db.collection(getCollectionName()).doc(vehicle.id).set(vehicle, { merge: true });
+    await withTimeout(
+      db.collection(getCollectionName()).doc(vehicle.id).set(vehicle, { merge: true }),
+      12000,
+      'O Firebase não confirmou o salvamento em 12 segundos. Verifique sua conexão e as Regras do Firestore.'
+    );
   }
 
   async function firestoreDeleteVehicle(id) {
@@ -389,7 +431,11 @@
       saveLocalVehicles(state.vehicles);
       return;
     }
-    await db.collection(getCollectionName()).doc(id).delete();
+    await withTimeout(
+      db.collection(getCollectionName()).doc(id).delete(),
+      12000,
+      'O Firebase não confirmou a exclusão em 12 segundos. Verifique sua conexão e as Regras do Firestore.'
+    );
   }
 
   async function firestoreClearAll() {
@@ -399,13 +445,17 @@
       return;
     }
     const colRef = db.collection(getCollectionName());
-    const snapshot = await colRef.get();
+    const snapshot = await withTimeout(
+      colRef.get({ source: 'server' }),
+      12000,
+      'O Firebase não respondeu ao limpar os dados.'
+    );
     const docs = snapshot.docs;
     const CHUNK = 400;
     for (let i = 0; i < docs.length; i += CHUNK) {
       const batch = db.batch();
       docs.slice(i, i + CHUNK).forEach((d) => batch.delete(d.ref));
-      await batch.commit();
+      await withTimeout(batch.commit(), 15000, 'Tempo esgotado ao apagar registros no Firebase.');
     }
     localStorage.removeItem(STORAGE_KEYS.LOCAL_VEHICLES);
   }
@@ -423,7 +473,11 @@
       vehicles.slice(i, i + CHUNK).forEach((v) => {
         batch.set(colRef.doc(v.id), v, { merge: true });
       });
-      await batch.commit();
+      await withTimeout(
+        batch.commit(),
+        15000,
+        'O Firebase não confirmou a importação. Verifique as Regras do Firestore Database.'
+      );
     }
   }
 
